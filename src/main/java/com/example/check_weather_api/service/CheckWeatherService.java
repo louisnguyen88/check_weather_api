@@ -1,105 +1,125 @@
 package com.example.check_weather_api.service;
 
-import com.example.check_weather_api.exception.InvalidApiKeyException;
-import com.example.check_weather_api.exception.RateLimitExceededException;
+import com.example.check_weather_api.exception.ApiErrorHandler;
 import com.example.check_weather_api.model.CheckWeatherData;
+import com.example.check_weather_api.model.CheckWeatherResponse;
 import com.example.check_weather_api.repository.CheckWeatherRepository;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.example.check_weather_api.utils.ApiKeyValidator;
+import com.example.check_weather_api.utils.RateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
-
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 
 @Service
 public class CheckWeatherService {
     private final CheckWeatherRepository weatherRepository;
-    private final RestTemplate restTemplate = new RestTemplate();
-
+    private final WebClient webClient;
     private static final Logger logger = LoggerFactory.getLogger(CheckWeatherService.class);
 
-    @Value("${openweathermap.api.key}")
-    private String apiKey;
+    private final ApiKeyValidator apiKeyValidator;
+
+    private final RateLimiter rateLimiter;
+
+    private final ApiErrorHandler apiErrorHandler;
 
     @Value("${openweathermap.base.url}")
     private String baseUrl;
 
-    private final ConcurrentHashMap<String, AtomicInteger> rateLimitMap = new ConcurrentHashMap<>();
 
-    public CheckWeatherService(CheckWeatherRepository weatherRepository) {
+
+    @Autowired
+    public CheckWeatherService(WebClient.Builder webClientBuilder,
+                               CheckWeatherRepository weatherRepository,
+                               ApiErrorHandler apiErrorHandler,
+                               ApiKeyValidator apiKeyValidator,
+                               RateLimiter rateLimiter) {
+        this.webClient = webClientBuilder.baseUrl("http://api.openweathermap.org/data/2.5/weather").build();
         this.weatherRepository = weatherRepository;
+        this.apiKeyValidator = apiKeyValidator;
+        this.rateLimiter = rateLimiter;
+        this.apiErrorHandler = apiErrorHandler;
+
+    }
+    public Mono<String> validatedWeatherRequest(String city, String country, String clientApiKey) {
+        apiKeyValidator.validate(clientApiKey);
+        rateLimiter.enforceRateLimit(clientApiKey);
+        return getWeatherDescription(city, country, clientApiKey);  // Calls the cacheable method
     }
 
-    public String getWeatherDescription(String city, String country, String clientApiKey) {
-        validateApiKey(clientApiKey);
-        enforceRateLimit(clientApiKey);
-
-        Optional<CheckWeatherData> cachedData = weatherRepository.findByCityAndCountry(city, country);
-        if (cachedData.isPresent()) {
-            return cachedData.get().getDescription();
-        }
-        return fetchAndCacheWeather(city, country);
+    @Cacheable(cacheNames = "weather", key = "#city + ',' + #country ")
+    public Mono<String> getWeatherDescription(String city, String country, String clientApiKey) {
+        return weatherRepository.findByCityAndCountry(city, country)
+                .flatMap(data -> Mono.just(data.getDescription()))
+                .switchIfEmpty(fetchAndCacheWeatherData(city, country, clientApiKey));
     }
 
-    private String fetchAndCacheWeather(String city, String country) {
-        String uri = String.format("%s?q=%s,%s&appid=%s", baseUrl, city, country, apiKey);
-        String response = restTemplate.getForObject(uri, String.class);
+    private Mono<String> fetchAndCacheWeatherData(String city, String country, String clientApiKey) {
+        String uri = String.format("?q=%s,%s&appid=%s", city, country, clientApiKey);
 
-        String description = parseDescription(response);
-        cacheWeatherData(city, country, description);
+        // Asynchronously fetch weather data from the downstream API
+        return webClient.get()
+                .uri(uri)
+                .retrieve()
+                .bodyToMono(CheckWeatherResponse.class)  // Directly map to WeatherApiResponse
+                .flatMap(weatherResponse -> {
+                    // Extract the description
+                    String description = weatherResponse.getWeather().stream()
+                            .findFirst()
+                            .map(CheckWeatherResponse.Weather::getDescription)
+                            .orElse("No description available");
 
-        return description;
+                    // Save the description asynchronously in H2
+                    return saveWeatherData(city, country, description).thenReturn(description);
+                });
+
     }
-
-    private String parseDescription(String response) {
-        try {
-            // Initialize ObjectMapper
-            ObjectMapper mapper = new ObjectMapper();
-
-            // Parse the JSON response into a JsonNode tree
-            JsonNode rootNode = mapper.readTree(response);
-
-            // Navigate to the "weather" array and get the first element's "description" field
-            JsonNode weatherArray = rootNode.path("weather");
-            if (weatherArray.isArray() && !weatherArray.isEmpty()) {
-                JsonNode descriptionNode = weatherArray.get(0).path("description");
-                return descriptionNode.asText();
-            } else {
-                throw new RuntimeException("Description field not found in weather data");
-            }
-        } catch (Exception e) {
-            // Handle parsing exceptions
-            // Log the exception at ERROR level
-            logger.error("Failed to parse description from response", e);
-            throw new RuntimeException("Failed to parse description from response", e);
-        }
-    }
-
-    private void cacheWeatherData(String city, String country, String description) {
+    @Transactional
+    private Mono<Void> saveWeatherData(String city, String country, String description) {
+        logger.debug("Saving weather data for city: {}, country: {}, description: {}", city, country, description);
         CheckWeatherData data = new CheckWeatherData();
         data.setCity(city);
         data.setCountry(country);
         data.setDescription(description);
-        weatherRepository.save(data);
+        return weatherRepository.save(data).then();
+
     }
 
-    private void validateApiKey(String clientApiKey) {
-        if (!clientApiKey.equals(apiKey)) {
-            throw new InvalidApiKeyException("Invalid API key.");
-        }
-    }
 
-    private void enforceRateLimit(String clientApiKey) {
-        rateLimitMap.putIfAbsent(clientApiKey, new AtomicInteger(0));
-        AtomicInteger requestCount = rateLimitMap.get(clientApiKey);
-
-        if (requestCount.incrementAndGet() > 5) {
-            throw new RateLimitExceededException("Hourly rate limit exceeded.");
-        }
-    }
+//    void validateApiKey(String clientApiKey) {
+//        // Ensure the API key is present in the Valid API key list
+//        if (clientApiKey == null || clientApiKey.isEmpty()) {
+//            logger.warn("Missing API key in request.");
+//            throw new InvalidApiKeyException("Missing API key.");
+//        }
+//
+//        if (!validApiKeys.contains(clientApiKey)) {
+//            logger.warn("Invalid API key: {}", clientApiKey);
+//            throw new InvalidApiKeyException("Invalid API key.");
+//        }
+//        // Initialize if absent
+//        rateLimitMap.computeIfAbsent(clientApiKey, k -> new RateLimiter());
+//    }
+//
+//    private void enforceRateLimit(String clientApiKey) {
+//        RateLimiter rateLimit = rateLimitMap.get(clientApiKey);
+//        LocalDateTime now = LocalDateTime.now();
+//        Duration durationSinceFirstRequest = Duration.between(rateLimit.getFirstRequestTime(), now);
+//
+//        // Reset the rate limit if more than an hour has passed
+//        if (durationSinceFirstRequest.toHours() >= 1) {
+//            rateLimit.reset();
+//        }
+//
+//        // Increment and check request count
+//        if (rateLimit.getRequestCount().incrementAndGet() > 5) {
+//            logger.warn("API key has exceeded its hourly request limit.");
+//            throw new RateLimitExceededException("Hourly rate limit exceeded for this API key.");
+//        }
+//    }
 }
